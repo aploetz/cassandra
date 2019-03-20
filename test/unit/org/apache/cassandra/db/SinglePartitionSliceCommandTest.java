@@ -232,7 +232,7 @@ public class SinglePartitionSliceCommandTest
                 assertTrue(unfiltered.isRow());
                 Row row = (Row) unfiltered;
                 assertEquals(deletionTime, row.deletion().time().markedForDeleteAt());
-                assertEquals(0, row.size()); // no btree
+                assertEquals(0, row.columnCount()); // no btree
             }
             count++;
         }
@@ -342,7 +342,7 @@ public class SinglePartitionSliceCommandTest
         SelectStatement stmt = (SelectStatement) QueryProcessor.parseStatement(q).prepare(ClientState.forInternalCalls());
 
         List<Unfiltered> unfiltereds = new ArrayList<>();
-        SinglePartitionReadQuery.Group<SinglePartitionReadCommand> query = (SinglePartitionReadQuery.Group<SinglePartitionReadCommand>) stmt.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds());
+        SinglePartitionReadQuery.Group<SinglePartitionReadCommand> query = (SinglePartitionReadQuery.Group<SinglePartitionReadCommand>) stmt.getQuery(QueryOptions.DEFAULT, 0);
         Assert.assertEquals(1, query.queries.size());
         SinglePartitionReadCommand command = Iterables.getOnlyElement(query.queries);
         try (ReadExecutionController controller = ReadExecutionController.forCommand(command);

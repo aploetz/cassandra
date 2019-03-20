@@ -207,7 +207,8 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     private volatile boolean isBootstrapMode;
 
     /* we bootstrap but do NOT join the ring unless told to do so */
-    private boolean isSurveyMode = Boolean.parseBoolean(System.getProperty("cassandra.write_survey", "false"));
+    private boolean isSurveyMode = Boolean.parseBoolean(System.getProperty
+            ("cassandra.write_survey", "false"));
     /* true if node is rebuilding and receiving data */
     private final AtomicBoolean isRebuilding = new AtomicBoolean();
     private final AtomicBoolean isDecommissioning = new AtomicBoolean();
@@ -242,6 +243,16 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     private boolean replacing;
 
     private final StreamStateStore streamStateStore = new StreamStateStore();
+
+    public boolean isSurveyMode()
+    {
+        return isSurveyMode;
+    }
+
+    public boolean hasJoined()
+    {
+        return joined;
+    }
 
     /** This method updates the local token on disk  */
     public void setTokens(Collection<Token> tokens)
@@ -1039,7 +1050,10 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         }
         else
         {
-            logger.info("Startup complete, but write survey mode is active, not becoming an active ring member. Use JMX (StorageService->joinRing()) to finalize ring joining.");
+            if (dataAvailable)
+                logger.info("Startup complete, but write survey mode is active, not becoming an active ring member. Use JMX (StorageService->joinRing()) to finalize ring joining.");
+            else
+                logger.warn("Some data streaming failed. Use nodetool to check bootstrap state and resume. For more, see `nodetool help bootstrap`. {}", SystemKeyspace.getBootstrapState());
         }
     }
 
@@ -1080,9 +1094,24 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         }
         else if (isSurveyMode)
         {
-            logger.info("Leaving write survey mode and joining ring at operator request");
-            finishJoiningRing(resumedBootstrap, SystemKeyspace.getSavedTokens());
-            isSurveyMode = false;
+            // if isSurveyMode is on then verify isBootstrapMode
+            // node can join the ring even if isBootstrapMode is true which should not happen
+            if (!isBootstrapMode())
+            {
+                logger.info("Leaving write survey mode and joining ring at operator request");
+                finishJoiningRing(resumedBootstrap, SystemKeyspace.getSavedTokens());
+                isSurveyMode = false;
+                daemon.start();
+            }
+            else
+            {
+                logger.warn("Can't join the ring because in write_survey mode and bootstrap hasn't completed");
+            }
+        }
+        else if (isBootstrapMode())
+        {
+            // bootstrap is not complete hence node cannot join the ring
+            logger.warn("Can't join the ring because bootstrap hasn't completed.");
         }
     }
 
@@ -1653,19 +1682,18 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                 public void onSuccess(StreamState streamState)
                 {
                     bootstrapFinished();
-                    // start participating in the ring.
-                    // pretend we are in survey mode so we can use joinRing() here
-                    isSurveyMode = true;
-                    try
+                    if(isSurveyMode)
                     {
-                        progressSupport.progress("bootstrap", ProgressEvent.createNotification("Joining ring..."));
-                        joinRing(true);
+                        logger.info("Startup complete, but write survey mode is active, not becoming an active ring member. Use JMX (StorageService->joinRing()) to finalize ring joining.");
                     }
-                    catch (IOException ignore)
+                    else
                     {
-                        // joinRing with survey mode does not throw IOException
+                        isSurveyMode = false;
+                        progressSupport.progress("bootstrap", ProgressEvent.createNotification("Joining ring..."));
+                        finishJoiningRing(true, bootstrapTokens);
                     }
                     progressSupport.progress("bootstrap", new ProgressEvent(ProgressEventType.COMPLETE, 1, 1, "Resume bootstrap complete"));
+                    daemon.start();
                     logger.info("Resume complete");
                 }
 
@@ -3681,7 +3709,30 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public void refreshSizeEstimates() throws ExecutionException
     {
+        cleanupSizeEstimates();
         FBUtilities.waitOnFuture(ScheduledExecutors.optionalTasks.submit(SizeEstimatesRecorder.instance));
+    }
+
+    public void cleanupSizeEstimates()
+    {
+        SetMultimap<String, String> sizeEstimates = SystemKeyspace.getTablesWithSizeEstimates();
+
+        for (Entry<String, Collection<String>> tablesByKeyspace : sizeEstimates.asMap().entrySet())
+        {
+            String keyspace = tablesByKeyspace.getKey();
+            if (!Schema.instance.getKeyspaces().contains(keyspace))
+            {
+                SystemKeyspace.clearSizeEstimates(keyspace);
+            }
+            else
+            {
+                for (String table : tablesByKeyspace.getValue())
+                {
+                    if (Schema.instance.getTableMetadataRef(keyspace, table) == null)
+                        SystemKeyspace.clearSizeEstimates(keyspace, table);
+                }
+            }
+        }
     }
 
     /**
@@ -3817,13 +3868,22 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         ActiveRepairService.instance.terminateSessions();
     }
 
-
     @Nullable
     public List<String> getParentRepairStatus(int cmd)
     {
         Pair<ActiveRepairService.ParentRepairStatus, List<String>> pair = ActiveRepairService.instance.getRepairStatus(cmd);
         return pair == null ? null :
                ImmutableList.<String>builder().add(pair.left.name()).addAll(pair.right).build();
+    }
+
+    public void setRepairSessionMaxTreeDepth(int depth)
+    {
+        DatabaseDescriptor.setRepairSessionMaxTreeDepth(depth);
+    }
+
+    public int getRepairSessionMaxTreeDepth()
+    {
+        return DatabaseDescriptor.getRepairSessionMaxTreeDepth();
     }
 
     /* End of MBean interface methods */

@@ -497,15 +497,15 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         return directories;
     }
 
-    public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor, long keyCount, long repairedAt, UUID pendingRepair, boolean isTransient, int sstableLevel, SerializationHeader header, LifecycleTransaction txn)
+    public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor, long keyCount, long repairedAt, UUID pendingRepair, boolean isTransient, int sstableLevel, SerializationHeader header, LifecycleNewTracker lifecycleNewTracker)
     {
         MetadataCollector collector = new MetadataCollector(metadata().comparator).sstableLevel(sstableLevel);
-        return createSSTableMultiWriter(descriptor, keyCount, repairedAt, pendingRepair, isTransient, collector, header, txn);
+        return createSSTableMultiWriter(descriptor, keyCount, repairedAt, pendingRepair, isTransient, collector, header, lifecycleNewTracker);
     }
 
-    public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor, long keyCount, long repairedAt, UUID pendingRepair, boolean isTransient, MetadataCollector metadataCollector, SerializationHeader header, LifecycleTransaction txn)
+    public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor, long keyCount, long repairedAt, UUID pendingRepair, boolean isTransient, MetadataCollector metadataCollector, SerializationHeader header, LifecycleNewTracker lifecycleNewTracker)
     {
-        return getCompactionStrategyManager().createSSTableMultiWriter(descriptor, keyCount, repairedAt, pendingRepair, isTransient, metadataCollector, header, indexManager.listIndexes(), txn);
+        return getCompactionStrategyManager().createSSTableMultiWriter(descriptor, keyCount, repairedAt, pendingRepair, isTransient, metadataCollector, header, indexManager.listIndexes(), lifecycleNewTracker);
     }
 
     public boolean supportsEarlyOpen()
@@ -2185,28 +2185,46 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
 
     public <V> V runWithCompactionsDisabled(Callable<V> callable, boolean interruptValidation, boolean interruptViews)
     {
+        return runWithCompactionsDisabled(callable, (sstable) -> true, interruptValidation, interruptViews, true);
+    }
+
+    /**
+     * Runs callable with compactions paused and compactions including sstables matching sstablePredicate stopped
+     *
+     * @param callable what to do when compactions are paused
+     * @param sstablesPredicate which sstables should we cancel compactions for
+     * @param interruptValidation if we should interrupt validation compactions
+     * @param interruptViews if we should interrupt view compactions
+     * @param interruptIndexes if we should interrupt compactions on indexes. NOTE: if you set this to true your sstablePredicate
+     *                         must be able to handle LocalPartitioner sstables!
+     */
+    public <V> V runWithCompactionsDisabled(Callable<V> callable, Predicate<SSTableReader> sstablesPredicate, boolean interruptValidation, boolean interruptViews, boolean interruptIndexes)
+    {
         // synchronize so that concurrent invocations don't re-enable compactions partway through unexpectedly,
         // and so we only run one major compaction at a time
         synchronized (this)
         {
             logger.trace("Cancelling in-progress compactions for {}", metadata.name);
+            Iterable<ColumnFamilyStore> toInterruptFor = interruptIndexes
+                                                         ? concatWithIndexes()
+                                                         : Collections.singleton(this);
 
-            Iterable<ColumnFamilyStore> selfWithAuxiliaryCfs = interruptViews
-                                                               ? Iterables.concat(concatWithIndexes(), viewManager.allViewsCfs())
-                                                               : concatWithIndexes();
+            toInterruptFor = interruptViews
+                             ? Iterables.concat(toInterruptFor, viewManager.allViewsCfs())
+                             : toInterruptFor;
 
-            for (ColumnFamilyStore cfs : selfWithAuxiliaryCfs)
+            for (ColumnFamilyStore cfs : toInterruptFor)
                 cfs.getCompactionStrategyManager().pause();
             try
             {
                 // interrupt in-progress compactions
-                CompactionManager.instance.interruptCompactionForCFs(selfWithAuxiliaryCfs, interruptValidation);
-                CompactionManager.instance.waitForCessation(selfWithAuxiliaryCfs);
+                CompactionManager.instance.interruptCompactionForCFs(toInterruptFor, sstablesPredicate, interruptValidation);
+                CompactionManager.instance.waitForCessation(toInterruptFor, sstablesPredicate);
 
                 // doublecheck that we finished, instead of timing out
-                for (ColumnFamilyStore cfs : selfWithAuxiliaryCfs)
+                for (ColumnFamilyStore cfs : toInterruptFor)
                 {
-                    if (!cfs.getTracker().getCompacting().isEmpty())
+                    if (cfs.getTracker().getCompacting().stream().anyMatch(sstablesPredicate))
                     {
                         logger.warn("Unable to cancel in-progress compactions for {}.  Perhaps there is an unusually large row in progress somewhere, or the system is simply overloaded.", metadata.name);
                         return null;
@@ -2226,7 +2244,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
             }
             finally
             {
-                for (ColumnFamilyStore cfs : selfWithAuxiliaryCfs)
+                for (ColumnFamilyStore cfs : toInterruptFor)
                     cfs.getCompactionStrategyManager().resume();
             }
         }
@@ -2241,7 +2259,6 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
                 assert data.getCompacting().isEmpty() : data.getCompacting();
                 Iterable<SSTableReader> sstables = getLiveSSTables();
                 sstables = AbstractCompactionStrategy.filterSuspectSSTables(sstables);
-                sstables = ImmutableList.copyOf(sstables);
                 LifecycleTransaction modifier = data.tryModify(sstables, operationType);
                 assert modifier != null: "something marked things compacting while compactions are disabled";
                 return modifier;
